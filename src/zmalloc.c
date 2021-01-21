@@ -33,6 +33,7 @@
 #include "Win32_Interop/win32_types.h"
 #include "Win32_Interop/win32fixes.h"
 #include "Win32_Interop/Win32_QFork.h"
+#include "Win32_Interop/Win32_PThread.h"
 #endif
 
 #include <stdio.h>
@@ -188,9 +189,6 @@ void *zrealloc(void *ptr, size_t size) {
 size_t zmalloc_size(void *ptr) {
     void *realptr = (char*)ptr-PREFIX_SIZE;
     size_t size = *((size_t*)realptr);
-    /* Assume at least that all the allocations are padded at sizeof(long) by
-     * the underlying allocator. */
-    if (size&(sizeof(PORT_LONG)-1)) size += sizeof(PORT_LONG)-(size&(sizeof(PORT_LONG)-1));
     return size+PREFIX_SIZE;
 }
 size_t zmalloc_usable(void *ptr) {
@@ -333,6 +331,13 @@ int zmalloc_get_allocator_info(size_t *allocated,
      * into account all allocations done by this process (not only zmalloc). */
     je_mallctl("stats.allocated", allocated, &sz, NULL, 0);
     return 1;
+}
+
+void set_jemalloc_bg_thread(int enable) {
+    /* let jemalloc do purging asynchronously, required when there's no traffic 
+     * after flushdb */
+    char val = !!enable;
+    je_mallctl("background_thread", NULL, 0, &val, 1);
 }
 #else
 int zmalloc_get_allocator_info(size_t *allocated,

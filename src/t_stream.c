@@ -67,6 +67,27 @@ void freeStream(stream *s) {
     zfree(s);
 }
 
+/* Set 'id' to be its successor streamID */
+void streamIncrID(streamID *id) {
+    if (id->seq == UINT64_MAX) {
+        if (id->ms == UINT64_MAX) {
+            /* Special case where 'id' is the last possible streamID... */
+            id->ms = id->seq = 0;
+        } else {
+            id->ms++;
+            id->seq = 0;
+        }
+    } else {
+        id->seq++;
+    }
+}
+
+/* Return the length of a stream. */
+PORT_ULONG streamLength(const robj *subject) {
+    stream *s = subject->ptr;
+    return s->length;
+}
+
 /* Generate the next stream item ID given the previous one. If the current
  * milliseconds Unix time is greater than the previous one, just use this
  * as time part and start with sequence part of zero. Otherwise we use the
@@ -77,8 +98,8 @@ void streamNextID(streamID *last_id, streamID *new_id) {
         new_id->ms = ms;
         new_id->seq = 0;
     } else {
-        new_id->ms = last_id->ms;
-        new_id->seq = last_id->seq+1;
+        *new_id = *last_id;
+        streamIncrID(new_id);
     }
 }
 
@@ -173,9 +194,19 @@ int streamCompareID(streamID *a, streamID *b) {
  * C_ERR if an ID was given via 'use_id', but adding it failed since the
  * current top ID is greater or equal. */
 int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_id, streamID *use_id) {
-    /* If an ID was given, check that it's greater than the last entry ID
-     * or return an error. */
-    if (use_id && streamCompareID(use_id,&s->last_id) <= 0) return C_ERR;
+    
+    /* Generate the new entry ID. */
+    streamID id;
+    if (use_id)
+        id = *use_id;
+    else
+        streamNextID(&s->last_id,&id);
+
+    /* Check that the new ID is greater than the last entry ID
+     * or return an error. Automatically generated IDs might
+     * overflow (and wrap-around) when incrementing the sequence 
+       part. */
+    if (streamCompareID(&id,&s->last_id) <= 0) return C_ERR;
 
     /* Add the new entry. */
     raxIterator ri;
@@ -191,13 +222,6 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         lp_bytes = lpBytes(lp);
     }
     raxStop(&ri);
-
-    /* Generate the new entry ID. */
-    streamID id;
-    if (use_id)
-        id = *use_id;
-    else
-        streamNextID(&s->last_id,&id);
 
     /* We have to add the key into the radix tree in lexicographic order,
      * to do so we consider the ID as a single 128 bit number written in
@@ -242,17 +266,17 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
      * the current node is full. */
     if (lp != NULL) {
         if (server.stream_node_max_bytes &&
-            lp_bytes > server.stream_node_max_bytes)
+            lp_bytes >= server.stream_node_max_bytes)
         {
             lp = NULL;
         } else if (server.stream_node_max_entries) {
             int64_t count = lpGetInteger(lpFirst(lp));
-            if (count > server.stream_node_max_entries) lp = NULL;
+            if (count >= server.stream_node_max_entries) lp = NULL;
         }
     }
 
     int flags = STREAM_ITEM_FLAG_NONE;
-    if (lp == NULL || lp_bytes > server.stream_node_max_bytes) {
+    if (lp == NULL || lp_bytes >= server.stream_node_max_bytes) {
         master_id = id;
         streamEncodeID(rax_key,&id);
         /* Create the listpack having the master entry ID and fields. */
@@ -773,6 +797,16 @@ int streamDeleteItem(stream *s, streamID *id) {
     return deleted;
 }
 
+/* Get the last valid (non-tombstone) streamID of 's'. */
+void streamLastValidID(stream *s, streamID *maxid)
+{
+    streamIterator si;
+    streamIteratorStart(&si,s,NULL,NULL,1);
+    int64_t numfields;
+    streamIteratorGetID(&si,maxid,&numfields);
+    streamIteratorStop(&si);
+}
+
 /* Emit a reply in the client output buffer by formatting a Stream ID
  * in the standard <ms>-<seq> format, using the simple string protocol
  * of REPL. */
@@ -814,6 +848,11 @@ void streamPropagateXCLAIM(client *c, robj *key, streamCG *group, robj *groupnam
     argv[11] = createStringObject("JUSTID",6);
     argv[12] = createStringObject("LASTID",6);
     argv[13] = createObjectFromStreamID(&group->last_id);
+
+    /* We use progagate() because this code path is not always called from
+     * the command execution context. Moreover this will just alter the
+     * consumer group state, and we don't need MULTI/EXEC wrapping because
+     * there is no message state cross-message atomicity required. */
     propagate(server.xclaimCommand,c->db->id,argv,14,PROPAGATE_AOF|PROPAGATE_REPL);
     decrRefCount(argv[0]);
     decrRefCount(argv[3]);
@@ -841,6 +880,11 @@ void streamPropagateGroupID(client *c, robj *key, streamCG *group, robj *groupna
     argv[2] = key;
     argv[3] = groupname;
     argv[4] = createObjectFromStreamID(&group->last_id);
+
+    /* We use progagate() because this code path is not always called from
+     * the command execution context. Moreover this will just alter the
+     * consumer group state, and we don't need MULTI/EXEC wrapping because
+     * there is no message state cross-message atomicity required. */
     propagate(server.xgroupCommand,c->db->id,argv,5,PROPAGATE_AOF|PROPAGATE_REPL);
     decrRefCount(argv[0]);
     decrRefCount(argv[1]);
@@ -1216,11 +1260,26 @@ void xaddCommand(client *c) {
         return;
     }
 
+    /* Return ASAP if minimal ID (0-0) was given so we avoid possibly creating
+     * a new stream and have streamAppendItem fail, leaving an empty key in the
+     * database. */
+    if (id_given && id.ms == 0 && id.seq == 0) {
+        addReplyError(c,"The ID specified in XADD must be greater than 0-0");
+        return;
+    }
+
     /* Lookup the stream at key. */
     robj *o;
     stream *s;
     if ((o = streamTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
     s = o->ptr;
+
+    /* Return ASAP if the stream has reached the last possible ID */
+    if (s->last_id.ms == UINT64_MAX && s->last_id.seq == UINT64_MAX) {
+        addReplyError(c,"The stream has exhausted the last possible ID, "
+                        "unable to add more items");
+        return;
+    }
 
     /* Append using the low level function and return the ID. */
     if (streamAppendItem(s,c->argv+field_pos,(c->argc-field_pos)/2,
@@ -1485,20 +1544,23 @@ void xreadCommand(client *c) {
             {
                 serve_synchronously = 1;
                 serve_history = 1;
-            } else {
+            } else if (s->length) {
                 /* We also want to serve a consumer in a consumer group
                  * synchronously in case the group top item delivered is smaller
                  * than what the stream has inside. */
-                streamID *last = &groups[i]->last_id;
-                if (s->length && (streamCompareID(&s->last_id, last) > 0)) {
+                streamID maxid, *last = &groups[i]->last_id;
+                streamLastValidID(s, &maxid);
+                if (streamCompareID(&maxid, last) > 0) {
                     serve_synchronously = 1;
                     *gt = *last;
                 }
             }
-        } else {
+        } else if (s->length) {
             /* For consumers without a group, we serve synchronously if we can
              * actually provide at least one item from the stream. */
-            if (s->length && (streamCompareID(&s->last_id, gt) > 0)) {
+            streamID maxid;
+            streamLastValidID(s, &maxid);
+            if (streamCompareID(&maxid, gt) > 0) {
                 serve_synchronously = 1;
             }
         }
@@ -1510,7 +1572,7 @@ void xreadCommand(client *c) {
              * so start from the next ID, since we want only messages with
              * IDs greater than start. */
             streamID start = *gt;
-            start.seq++; /* uint64_t can't overflow in this context. */
+            streamIncrID(&start);
 
             /* Emit the two elements sub-array consisting of the name
              * of the stream and the data we extracted from it. */
@@ -1518,7 +1580,8 @@ void xreadCommand(client *c) {
             addReplyBulk(c,c->argv[streams_arg+i]);
             streamConsumer *consumer = NULL;
             if (groups) consumer = streamLookupConsumer(groups[i],
-                                                        consumername->ptr,1);
+                                                        consumername->ptr,
+                                                        SLC_NONE);
             streamPropInfo spi = {c->argv[i+streams_arg],groupname};
             int flags = 0;
             if (noack) flags |= STREAM_RWR_NOACK;
@@ -1651,7 +1714,9 @@ streamCG *streamLookupCG(stream *s, sds groupname) {
  * consumer does not exist it is automatically created as a side effect
  * of calling this function, otherwise its last seen time is updated and
  * the existing consumer reference returned. */
-streamConsumer *streamLookupConsumer(streamCG *cg, sds name, int create) {
+streamConsumer *streamLookupConsumer(streamCG *cg, sds name, int flags) {
+    int create = !(flags & SLC_NOCREAT);
+    int refresh = !(flags & SLC_NOREFRESH);
     streamConsumer *consumer = raxFind(cg->consumers,(unsigned char*)name,
                                sdslen(name));
     if (consumer == raxNotFound) {
@@ -1662,7 +1727,7 @@ streamConsumer *streamLookupConsumer(streamCG *cg, sds name, int create) {
         raxInsert(cg->consumers,(unsigned char*)name,sdslen(name),
                   consumer,NULL);
     }
-    consumer->seen_time = mstime();
+    if (refresh) consumer->seen_time = mstime();
     return consumer;
 }
 
@@ -1670,7 +1735,8 @@ streamConsumer *streamLookupConsumer(streamCG *cg, sds name, int create) {
  * may have pending messages: they are removed from the PEL, and the number
  * of pending messages "lost" is returned. */
 uint64_t streamDelConsumer(streamCG *cg, sds name) {
-    streamConsumer *consumer = streamLookupConsumer(cg,name,0);
+    streamConsumer *consumer =
+        streamLookupConsumer(cg,name,SLC_NOCREAT|SLC_NOREFRESH);
     if (consumer == NULL) return 0;
 
     uint64_t retval = raxSize(consumer->pel);
@@ -1847,11 +1913,7 @@ void xsetidCommand(client *c) {
      * item, otherwise the fundamental ID monotonicity assumption is violated. */
     if (s->length > 0) {
         streamID maxid;
-        streamIterator si;
-        streamIteratorStart(&si,s,NULL,NULL,1);
-        int64_t numfields;
-        streamIteratorGetID(&si,&maxid,&numfields);
-        streamIteratorStop(&si);
+        streamLastValidID(s,&maxid);
 
         if (streamCompareID(&id,&maxid) < 0) {
             addReplyError(c,"The ID specified in XSETID is smaller than the "
@@ -2005,15 +2067,18 @@ void xpendingCommand(client *c) {
     }
     /* XPENDING <key> <group> <start> <stop> <count> [<consumer>] variant. */
     else {
-        streamConsumer *consumer = consumername ?
-                                streamLookupConsumer(group,consumername->ptr,0):
-                                NULL;
+        streamConsumer *consumer = NULL;
+        if (consumername) {
+            consumer = streamLookupConsumer(group,
+                                            consumername->ptr,
+                                            SLC_NOCREAT|SLC_NOREFRESH);
 
-        /* If a consumer name was mentioned but it does not exist, we can
-         * just return an empty array. */
-        if (consumername && consumer == NULL) {
-            addReplyMultiBulkLen(c,0);
-            return;
+            /* If a consumer name was mentioned but it does not exist, we can
+             * just return an empty array. */
+            if (consumer == NULL) {
+                addReplyMultiBulkLen(c,0);
+                return;
+            }
         }
 
         rax *pel = consumer ? consumer->pel : group->pel;
@@ -2222,7 +2287,7 @@ void xclaimCommand(client *c) {
     }
 
     /* Do the actual claiming. */
-    streamConsumer *consumer = streamLookupConsumer(group,c->argv[3]->ptr,1);
+    streamConsumer *consumer = NULL;
     void *arraylenptr = addDeferredMultiBulkLength(c);
     size_t arraylen = 0;
     for (int j = 5; j <= last_id_arg; j++) {
@@ -2274,9 +2339,11 @@ void xclaimCommand(client *c) {
             if (nack->consumer)
                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
             /* Update the consumer and idle time. */
+            if (consumer == NULL)
+                consumer = streamLookupConsumer(group,c->argv[3]->ptr,SLC_NONE);
             nack->consumer = consumer;
             nack->delivery_time = deliverytime;
-            /* Set the delivery attempts counter if given, otherwise 
+            /* Set the delivery attempts counter if given, otherwise
              * autoincrement unless JUSTID option provided */
             if (retrycount >= 0) {
                 nack->delivery_count = retrycount;

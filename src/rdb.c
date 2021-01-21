@@ -62,6 +62,7 @@ extern int rdbCheckMode;
 void rdbCheckError(const char *fmt, ...);
 void rdbCheckSetError(const char *fmt, ...);
 
+WIN32_ONLY(__declspec(noreturn))
 void rdbCheckThenExit(int linenum, char *reason, ...) {
     va_list ap;
     char msg[1024];
@@ -86,7 +87,7 @@ void rdbCheckThenExit(int linenum, char *reason, ...) {
 static int rdbWriteRaw(rio *rdb, void *p, size_t len) {
     if (rdb && rioWrite(rdb,p,len) == 0)
         return -1;
-    return (int)len;
+    return (int)len;                  WIN_PORT_FIX /* cast (int) */
 }
 
 /* This is just a wrapper for the low level function rioRead() that will
@@ -1000,10 +1001,10 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key) {
          * to call the right module during loading. */
         int retval = rdbSaveLen(rdb,mt->id);
         if (retval == -1) return -1;
-        io.bytes += retval;
 
         /* Then write the module-specific representation + EOF marker. */
         moduleInitIOContext(io,mt,rdb,key);
+        io.bytes += retval;
         mt->rdb_save(&io,mv->value);
         retval = rdbSaveLen(rdb,RDB_MODULE_OPCODE_EOF);
         if (retval == -1)
@@ -1126,6 +1127,9 @@ ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt) {
     /* Save a module-specific aux value. */
     RedisModuleIO io;
     int retval = rdbSaveType(rdb, RDB_OPCODE_MODULE_AUX);
+    if (retval == -1) return -1;
+    moduleInitIOContext(io,mt,rdb,NULL);                           WIN_PORT_FIX /*moved earlier before first usage of "io"*/
+    io.bytes += retval;
 
     /* Write the "module" identifier as prefix, so that we'll be able
      * to call the right module during loading. */
@@ -1144,7 +1148,6 @@ ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt) {
     io.bytes += retval;
 
     /* Then write the module-specific representation + EOF marker. */
-    moduleInitIOContext(io,mt,rdb,NULL);
     mt->aux_save(&io,when);
     retval = rdbSaveLen(rdb,RDB_MODULE_OPCODE_EOF);
     if (retval == -1)
@@ -1812,8 +1815,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, robj *key) {
                     rdbExitReportCorruptRDB(
                         "Error reading the consumer name from Stream group");
                 }
-                streamConsumer *consumer = streamLookupConsumer(cgroup,cname,
-                                           1);
+                streamConsumer *consumer =
+                    streamLookupConsumer(cgroup,cname,SLC_NONE);
                 sdsfree(cname);
                 consumer->seen_time = rdbLoadMillisecondTime(rdb,RDB_VERSION);
 
@@ -1925,7 +1928,7 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
         /* The DB can take some non trivial amount of time to load. Update
          * our cached time since it is used to create and update the last
          * interaction time with clients and for other important things. */
-        updateCachedTime();
+        updateCachedTime(0);
         if (server.masterhost && server.repl_state == REPL_STATE_TRANSFER)
             replicationSendNewlineToMaster();
         loadingProgress((off_t)r->processed_bytes);                             WIN_PORT_FIX /* cast (off_t) */

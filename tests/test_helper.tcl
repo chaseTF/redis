@@ -342,14 +342,14 @@ proc show_clients_state {} {
 
 proc kill_clients {} {
     foreach p $::clients_pids {
-        catch {exec kill $p}
+        catch {kill_proc2 $p}
     }
 }
 
 proc force_kill_all_servers {} {
     foreach p $::active_servers {
         puts "Killing still running Redis server $p"
-        catch {exec kill -9 $p}
+        catch {kill_proc2 $p}
     }
 }
 
@@ -452,6 +452,18 @@ proc print_help_screen {} {
         "--wait-server      Wait after server is started (so that you can attach a debugger)."
         "--help             Print this help screen."
     } "\n"]
+}
+
+# [tporadowski] "debug restart" command in Redis for Windows causes a new process
+#  with new PID to be started, so we need to properly clean this up when running tests
+#  from Cygwin
+set ::winpids {}
+set ::uses_cygwin 0
+if {$::tcl_platform(platform) == "unix"} {
+    set uname [exec uname -s]
+    if {[string first "CYGWIN" $uname] != -1} {
+        set ::uses_cygwin 1
+    }
 }
 
 # parse arguments
